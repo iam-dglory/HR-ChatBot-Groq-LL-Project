@@ -1,0 +1,178 @@
+import random
+from typing import List, Dict, Any
+from langchain_groq import ChatGroq  # Importing Groq LLM
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.schema import Document
+import PyPDF2
+import gradio as gr
+
+class HRPolicyExtractor:
+    def __init__(self, pdf_path: str):
+        self.pdf_path = pdf_path
+
+    def extract_text(self) -> str:
+        """
+        Extracts text from the given PDF file.
+        """
+        try:
+            with open(self.pdf_path, "rb") as file:
+                reader = PyPDF2.PdfReader(file)
+                raw_text = ""
+                for page in reader.pages:
+                    raw_text += page.extract_text()
+            return raw_text
+        except Exception as e:
+            raise RuntimeError(f"Error reading PDF: {e}")
+
+    def extract_definitions(self, text: str) -> List[Dict[str, str]]:
+        """
+        Extracts the definitions section into a structured dataset.
+        """
+        definitions = []
+        start_marker = "6. Definitions"
+        end_marker = "CHAPTER 2"
+
+        # Extract the relevant portion of the text
+        start = text.find(start_marker)
+        end = text.find(end_marker, start)
+        definitions_text = text[start:end].split("\n")
+
+        # Process definitions line by line
+        for line in definitions_text:
+            if "–" in line or ":" in line:  # Detect definition format
+                parts = line.split("–") if "–" in line else line.split(":")
+                if len(parts) == 2:
+                    term = parts[0].strip()
+                    definition = parts[1].strip()
+                    definitions.append({"Term": term, "Definition": definition})
+
+        return definitions
+
+
+class HRFAQBot:
+    def __init__(self, knowledge_base_path: str,
+                 chunk_size: int = 350, chunk_overlap: int = 50):
+        """
+        Initialize the HR FAQ Bot with Groq LLM and RAG pipeline.
+        """
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+
+        # Initialize Groq LLM
+        self.llm = ChatGroq(
+            model_name="llama3-8b-8192",
+            temperature=0.2,
+            max_tokens=500,
+            groq_api_key=groq_api_key
+        )
+
+        # Initialize embeddings
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="all-MiniLM-L6-v2",
+            cache_folder="./embedding_cache"
+        )
+
+        # Load and process the HR policy document
+        extractor = HRPolicyExtractor(knowledge_base_path)
+        raw_text = extractor.extract_text()
+        self.knowledge_base = self._load_and_process_knowledge_base(raw_text)
+
+        # Setup RAG pipeline
+        self.setup_rag_pipeline()
+        self.setup_conversational_elements()
+
+    def _load_and_process_knowledge_base(self, raw_text: str) -> List[Document]:
+        """
+        Process the HR knowledge base into documents.
+        """
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
+        )
+
+        documents = text_splitter.create_documents(
+            [raw_text],
+            metadatas=[{"source": "HR Policy Manual"}]
+        )
+        return documents
+
+    def setup_rag_pipeline(self):
+        """
+        Setup the RAG pipeline with vectorstore and retrievers.
+        """
+        self.vectorstore = FAISS.from_documents(self.knowledge_base, self.embeddings)
+
+        qa_template = """
+        You are an HR FAQ assistant. Provide accurate and professional answers based on the HR policy document.
+
+        Context: {context}
+        Question: {question}
+        Response:
+        """
+        PROMPT = PromptTemplate(
+            template=qa_template,
+            input_variables=["context", "question"]
+        )
+
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": 2})
+        self.qa_chain = RetrievalQA.from_chain_type(
+            llm=self.llm,
+            retriever=retriever,
+            chain_type="stuff",
+            chain_type_kwargs={"prompt": PROMPT},
+            return_source_documents=True
+        )
+
+    def setup_conversational_elements(self):
+        """
+        Setup predefined HR-specific conversational elements.
+        """
+        self.greeting_patterns = [
+            "hi", "hello", "help", "hr question", "policy help", "benefits info"
+        ]
+        self.greeting_responses = [
+            "Hello! How can I assist you with HR-related queries today?",
+            "Hi! I’m here to help you with any HR or workplace-related questions.",
+        ]
+
+    def chat(self, user_input: str) -> str:
+        """
+        Process the user's input and return a response.
+        """
+        if any(pattern in user_input.lower() for pattern in self.greeting_patterns):
+            return random.choice(self.greeting_responses)
+
+        response = self.qa_chain({"query": user_input})
+        return response["result"]
+
+
+def main():
+    bot = HRFAQBot(
+        knowledge_base_path="/content/HR Policy Manual 2023 (8) (1).pdf"
+        #groq_api_key="HRFAQQ"
+    )
+
+    def chat_interface(user_input: str):
+        return bot.chat(user_input)
+
+    gr.Interface(
+        fn=chat_interface,
+        inputs="text",
+        outputs="text",
+        title="HR FAQ Bot",
+        description="Ask questions about HR policies, benefits, or workplace guidelines.",
+        examples=[
+            ["What is the leave policy?"],
+            ["How can I claim medical benefits?"],
+            ["What is the process for resignation?"]
+        ]
+    ).launch(debug = True)
+
+
+if __name__ == "__main__":
+    main()
